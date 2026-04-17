@@ -1,9 +1,14 @@
 'use strict';
 
+const { DEFAULT_CLEANUP_INTERVAL_MS } = require('../config/defaults');
+
 class MemoryStore {
-  constructor() {
+  constructor({ cleanupIntervalMs = DEFAULT_CLEANUP_INTERVAL_MS, autoCleanup = true } = {}) {
     this.store = new Map();
-    this._startCleanup();
+    this._cleanupIntervalMs = cleanupIntervalMs;
+    if (autoCleanup) {
+      this._startCleanup();
+    }
   }
 
   async get(key) {
@@ -39,28 +44,53 @@ class MemoryStore {
     return entry.value;
   }
 
+  async decrement(key) {
+    const entry = this.store.get(key);
+    if (!entry) return 0;
+    if (Date.now() > entry.expiresAt) {
+      this.store.delete(key);
+      return 0;
+    }
+    if (typeof entry.value === 'number' && entry.value > 0) {
+      entry.value -= 1;
+    }
+    return entry.value;
+  }
+
   async reset(key) {
     this.store.delete(key);
   }
 
-  _startCleanup() {
-    this._cleanupInterval = setInterval(() => {
-      const now = Date.now();
-      for (const [key, entry] of this.store.entries()) {
-        if (now > entry.expiresAt) {
-          this.store.delete(key);
-        }
-      }
-    }, 60000);
+  async resetAll() {
+    this.store.clear();
+  }
 
-    // Allow the process to exit even if interval is active
+  async size() {
+    this._cleanup();
+    return this.store.size;
+  }
+
+  _cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.store.entries()) {
+      if (now > entry.expiresAt) {
+        this.store.delete(key);
+      }
+    }
+  }
+
+  _startCleanup() {
+    this._cleanupInterval = setInterval(() => this._cleanup(), this._cleanupIntervalMs);
     if (this._cleanupInterval.unref) {
       this._cleanupInterval.unref();
     }
   }
 
   destroy() {
-    clearInterval(this._cleanupInterval);
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
     this.store.clear();
   }
 }

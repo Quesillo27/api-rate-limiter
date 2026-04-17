@@ -1,10 +1,5 @@
 'use strict';
 
-/**
- * Fixed Window strategy.
- * Divides time into fixed windows of windowMs duration.
- * Counts requests within the current window and resets at the window boundary.
- */
 async function fixedWindow(store, key, options) {
   const { max, windowMs } = options;
   const ttl = Math.ceil(windowMs / 1000);
@@ -20,4 +15,11 @@ async function fixedWindow(store, key, options) {
   };
 }
 
+async function fixedWindowDecrement(store, key) {
+  if (typeof store.decrement === 'function') {
+    await store.decrement(key);
+  }
+}
+
 module.exports = fixedWindow;
+module.exports.decrement = fixedWindowDecrement;

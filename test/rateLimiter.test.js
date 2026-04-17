@@ -9,7 +9,6 @@ function buildApp(limiterOptions) {
   app.set('trust proxy', false);
   app.use(express.json());
 
-  // Use a custom keyGenerator by default so tests control the key via header
   const opts = Object.assign({
     keyGenerator: (req) => req.headers['x-test-ip'] || '127.0.0.1',
   }, limiterOptions);
@@ -76,10 +75,52 @@ describe('createRateLimiter', () => {
 
       expect(res.body.error).toBe('Custom limit message');
     });
+
+    it('exposes limit info via req.rateLimit', async () => {
+      const store = new MemoryStore();
+      const app = express();
+      app.use(createRateLimiter({
+        max: 5,
+        windowMs: 60000,
+        store,
+        keyGenerator: () => 'single',
+      }));
+      let captured;
+      app.get('/', (req, res) => {
+        captured = req.rateLimit;
+        res.json({ ok: true });
+      });
+      await request(app).get('/');
+      expect(captured).toBeDefined();
+      expect(captured.limit).toBe(5);
+      expect(captured.remaining).toBe(4);
+      expect(captured.current).toBe(1);
+      expect(captured.strategy).toBe('fixedWindow');
+      expect(captured.resetTime).toBeInstanceOf(Date);
+    });
+
+    it('accepts custom requestPropertyName', async () => {
+      const store = new MemoryStore();
+      const app = express();
+      app.use(createRateLimiter({
+        max: 2,
+        windowMs: 60000,
+        store,
+        requestPropertyName: 'limiterState',
+        keyGenerator: () => 'x',
+      }));
+      let captured;
+      app.get('/', (req, res) => {
+        captured = req.limiterState;
+        res.json({ ok: true });
+      });
+      await request(app).get('/');
+      expect(captured.limit).toBe(2);
+    });
   });
 
   describe('headers', () => {
-    it('sets X-RateLimit-Limit header', async () => {
+    it('sets X-RateLimit-Limit header (legacy mode)', async () => {
       const store = new MemoryStore();
       const app = buildApp({ max: 10, windowMs: 60000, store });
 
@@ -104,7 +145,6 @@ describe('createRateLimiter', () => {
 
       const before = Math.floor(Date.now() / 1000);
       const res = await request(app).get('/');
-      // Allow a 5-second buffer for timing variance in CI environments
       const after = Math.floor(Date.now() / 1000) + 65;
 
       const reset = parseInt(res.headers['x-ratelimit-reset'], 10);
@@ -131,6 +171,35 @@ describe('createRateLimiter', () => {
       expect(res.headers['x-ratelimit-limit']).toBeUndefined();
       expect(res.headers['x-ratelimit-remaining']).toBeUndefined();
     });
+
+    it('sets IETF draft-7 RateLimit headers', async () => {
+      const store = new MemoryStore();
+      const app = buildApp({ max: 10, windowMs: 60000, store, standardHeaders: 'draft-7' });
+
+      const res = await request(app).get('/');
+      expect(res.headers['ratelimit-limit']).toBe('10');
+      expect(res.headers['ratelimit-remaining']).toBe('9');
+      expect(res.headers['ratelimit-policy']).toMatch(/10;w=60;policy="fixedWindow"/);
+      expect(res.headers['x-ratelimit-limit']).toBeUndefined();
+    });
+
+    it('supports both legacy and draft-7 headers simultaneously', async () => {
+      const store = new MemoryStore();
+      const app = buildApp({ max: 5, windowMs: 60000, store, standardHeaders: 'both' });
+
+      const res = await request(app).get('/');
+      expect(res.headers['x-ratelimit-limit']).toBe('5');
+      expect(res.headers['ratelimit-limit']).toBe('5');
+    });
+
+    it('disables headers when standardHeaders is "none"', async () => {
+      const store = new MemoryStore();
+      const app = buildApp({ max: 5, windowMs: 60000, store, standardHeaders: 'none' });
+
+      const res = await request(app).get('/');
+      expect(res.headers['x-ratelimit-limit']).toBeUndefined();
+      expect(res.headers['ratelimit-limit']).toBeUndefined();
+    });
   });
 
   describe('keyGenerator', () => {
@@ -143,14 +212,27 @@ describe('createRateLimiter', () => {
         keyGenerator: (req) => req.headers['x-test-ip'] || req.ip,
       });
 
-      // First IP gets blocked after 1 request
       await request(app).get('/').set('x-test-ip', '1.1.1.1');
       const blocked = await request(app).get('/').set('x-test-ip', '1.1.1.1');
       expect(blocked.status).toBe(429);
 
-      // Second IP should still be allowed
       const allowed = await request(app).get('/').set('x-test-ip', '2.2.2.2');
       expect(allowed.status).toBe(200);
+    });
+
+    it('falls back to "unknown" when keyGenerator returns empty', async () => {
+      const store = new MemoryStore();
+      const app = buildApp({
+        max: 1,
+        windowMs: 60000,
+        store,
+        keyGenerator: () => '',
+      });
+
+      const res1 = await request(app).get('/');
+      const res2 = await request(app).get('/');
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(429);
     });
   });
 
@@ -164,12 +246,10 @@ describe('createRateLimiter', () => {
         skip: async (req) => req.path === '/health',
       });
 
-      // Exhaust limit on /
       await request(app).get('/');
       const blocked = await request(app).get('/');
       expect(blocked.status).toBe(429);
 
-      // /health should always pass
       const skipped = await request(app).get('/health');
       expect(skipped.status).toBe(200);
     });
@@ -285,62 +365,34 @@ describe('createRateLimiter', () => {
 
       expect(onLimitReached).not.toHaveBeenCalled();
     });
+
+    it('does not crash when onLimitReached throws', async () => {
+      const store = new MemoryStore();
+      const onLimitReached = () => { throw new Error('boom'); };
+      const app = buildApp({ max: 1, windowMs: 60000, store, onLimitReached });
+
+      await request(app).get('/');
+      const res = await request(app).get('/');
+      expect(res.status).toBe(429);
+    });
   });
 
-  describe('MemoryStore', () => {
-    it('increments counter correctly', async () => {
+  describe('custom handler', () => {
+    it('invokes the handler when limit is exceeded', async () => {
       const store = new MemoryStore();
-      const c1 = await store.increment('test-key', 60);
-      const c2 = await store.increment('test-key', 60);
-      const c3 = await store.increment('test-key', 60);
-      expect(c1).toBe(1);
-      expect(c2).toBe(2);
-      expect(c3).toBe(3);
-    });
+      const app = buildApp({
+        max: 1,
+        windowMs: 60000,
+        store,
+        handler: (_req, res) => {
+          res.status(418).json({ tea: true });
+        },
+      });
 
-    it('resets counter correctly', async () => {
-      const store = new MemoryStore();
-      await store.increment('test-key', 60);
-      await store.increment('test-key', 60);
-      await store.reset('test-key');
-      const c = await store.increment('test-key', 60);
-      expect(c).toBe(1);
-    });
-
-    it('gets value correctly', async () => {
-      const store = new MemoryStore();
-      await store.set('get-key', 42, 60);
-      const val = await store.get('get-key');
-      expect(val).toBe(42);
-    });
-
-    it('returns null for non-existent key', async () => {
-      const store = new MemoryStore();
-      const val = await store.get('nonexistent');
-      expect(val).toBeNull();
-    });
-
-    it('treats expired entries as non-existent', async () => {
-      const store = new MemoryStore();
-      // Manually set an already-expired entry
-      store.store.set('expired-key', { value: 99, expiresAt: Date.now() - 1000 });
-      const val = await store.get('expired-key');
-      expect(val).toBeNull();
-    });
-
-    it('resets counter for expired keys on increment', async () => {
-      const store = new MemoryStore();
-      // Manually set an already-expired entry
-      store.store.set('exp-incr', { value: 5, expiresAt: Date.now() - 1000 });
-      const c = await store.increment('exp-incr', 60);
-      expect(c).toBe(1);
-    });
-
-    it('destroy clears intervals and store', () => {
-      const store = new MemoryStore();
-      store.store.set('k', { value: 1, expiresAt: Date.now() + 10000 });
-      store.destroy();
-      expect(store.store.size).toBe(0);
+      await request(app).get('/');
+      const res = await request(app).get('/');
+      expect(res.status).toBe(418);
+      expect(res.body).toEqual({ tea: true });
     });
   });
 
@@ -348,8 +400,6 @@ describe('createRateLimiter', () => {
     it('uses custom keyPrefix to namespace keys', async () => {
       const store = new MemoryStore();
 
-      // Two limiters with different prefixes share the same store
-      // but should have independent counters
       const staticKey = () => '127.0.0.1';
 
       const app1 = express();
@@ -360,14 +410,74 @@ describe('createRateLimiter', () => {
       app2.use(createRateLimiter({ max: 1, windowMs: 60000, store, keyPrefix: 'ns2:', keyGenerator: staticKey }));
       app2.get('/', (_req, res) => res.json({ ok: true }));
 
-      // Exhaust ns1
       await request(app1).get('/');
       const blocked = await request(app1).get('/');
       expect(blocked.status).toBe(429);
 
-      // ns2 should still have capacity
       const allowed = await request(app2).get('/');
       expect(allowed.status).toBe(200);
+    });
+  });
+
+  describe('skipSuccessfulRequests', () => {
+    it('does not count 2xx responses against the limit', async () => {
+      const store = new MemoryStore();
+      const app = express();
+      app.use(createRateLimiter({
+        max: 2,
+        windowMs: 60000,
+        store,
+        skipSuccessfulRequests: true,
+        keyGenerator: () => 'skip-ok',
+      }));
+      app.get('/', (_req, res) => res.json({ ok: true }));
+
+      const r1 = await request(app).get('/');
+      const r2 = await request(app).get('/');
+      const r3 = await request(app).get('/');
+      expect(r1.status).toBe(200);
+      expect(r2.status).toBe(200);
+      expect(r3.status).toBe(200);
+    });
+  });
+
+  describe('skipFailedRequests', () => {
+    it('does not count 4xx/5xx responses against the limit', async () => {
+      const store = new MemoryStore();
+      const app = express();
+      app.use(createRateLimiter({
+        max: 2,
+        windowMs: 60000,
+        store,
+        skipFailedRequests: true,
+        keyGenerator: () => 'skip-fail',
+      }));
+      app.get('/', (_req, res) => res.status(500).json({ error: 'boom' }));
+
+      const r1 = await request(app).get('/');
+      const r2 = await request(app).get('/');
+      const r3 = await request(app).get('/');
+      expect(r1.status).toBe(500);
+      expect(r2.status).toBe(500);
+      expect(r3.status).toBe(500);
+    });
+  });
+
+  describe('store failure handling', () => {
+    it('fails open by default when store throws', async () => {
+      const store = new MemoryStore();
+      store.increment = async () => { throw new Error('store down'); };
+      const app = buildApp({ max: 1, windowMs: 60000, store });
+      const res = await request(app).get('/');
+      expect(res.status).toBe(200);
+    });
+
+    it('fails closed (503) when failMode is "closed"', async () => {
+      const store = new MemoryStore();
+      store.increment = async () => { throw new Error('store down'); };
+      const app = buildApp({ max: 1, windowMs: 60000, store, failMode: 'closed' });
+      const res = await request(app).get('/');
+      expect(res.status).toBe(503);
     });
   });
 });

@@ -1,14 +1,16 @@
 {
   "name": "api-rate-limiter",
-  "version": "1.0.0",
-  "description": "Express middleware for API rate limiting with Redis support. Multiple strategies: fixed window, sliding window, token bucket.",
+  "version": "1.1.0",
+  "description": "Express middleware for API rate limiting with Redis support. Three strategies (fixed/sliding/token-bucket), presets, IETF draft-7 headers, fail-open/closed, structured logger.",
   "main": "src/index.js",
   "scripts": {
     "test": "jest --coverage --forceExit",
     "test:watch": "jest --watch",
+    "test:ci": "jest --coverage --ci --forceExit",
     "example": "node examples/basic.js",
     "example:redis": "node examples/with-redis.js",
-    "example:advanced": "node examples/advanced.js"
+    "example:advanced": "node examples/advanced.js",
+    "example:presets": "node examples/presets.js"
   },
   "keywords": [
     "express",
@@ -20,7 +22,9 @@
     "throttle",
     "sliding-window",
     "token-bucket",
-    "fixed-window"
+    "fixed-window",
+    "ietf-draft-7",
+    "ratelimit-headers"
   ],
   "author": "",
   "license": "MIT",
@@ -42,11 +46,14 @@
     ],
     "coverageThreshold": {
       "global": {
-        "branches": 45,
-        "functions": 50,
-        "lines": 55,
-        "statements": 55
+        "branches": 70,
+        "functions": 85,
+        "lines": 80,
+        "statements": 80
       }
     }
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

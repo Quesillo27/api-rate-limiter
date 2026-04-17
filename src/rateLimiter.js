@@ -4,6 +4,20 @@ const MemoryStore = require('./stores/memoryStore');
 const fixedWindow = require('./strategies/fixedWindow');
 const slidingWindow = require('./strategies/slidingWindow');
 const tokenBucket = require('./strategies/tokenBucket');
+const { validateOptions } = require('./utils/validators');
+const { createLogger, isLoggerLike } = require('./utils/logger');
+const { setRateLimitHeaders, setRetryAfter, computeRetryAfterSeconds } = require('./utils/headers');
+const { StoreError } = require('./errors');
+const {
+  DEFAULT_WINDOW_MS,
+  DEFAULT_MAX,
+  DEFAULT_STATUS_CODE,
+  DEFAULT_MESSAGE,
+  DEFAULT_KEY_PREFIX,
+  DEFAULT_REQUEST_PROPERTY,
+  DEFAULT_STRATEGY,
+  DEFAULT_FAIL_MODE,
+} = require('./config/defaults');
 
 const STRATEGIES = {
   fixedWindow,
@@ -11,141 +25,151 @@ const STRATEGIES = {
   tokenBucket,
 };
 
-/**
- * Creates an Express rate limiter middleware.
- *
- * @param {object} options
- * @param {number}   options.windowMs               - Time window in milliseconds (default: 60000)
- * @param {number}   options.max                    - Max requests per window (default: 100)
- * @param {function} options.keyGenerator           - Function(req) => string key (default: req.ip)
- * @param {string}   options.strategy               - 'fixedWindow' | 'slidingWindow' | 'tokenBucket' (default: 'fixedWindow')
- * @param {object}   options.store                  - Store instance (default: new MemoryStore())
- * @param {string}   options.message                - Response message when limited (default: 'Too many requests...')
- * @param {number}   options.statusCode             - HTTP status code when limited (default: 429)
- * @param {boolean}  options.headers                - Send X-RateLimit-* headers (default: true)
- * @param {boolean}  options.skipSuccessfulRequests - Don't count successful (2xx/3xx) requests (default: false)
- * @param {boolean}  options.skipFailedRequests     - Don't count failed (4xx/5xx) requests (default: false)
- * @param {function} options.skip                   - Async function(req) => boolean, skip limiting if true
- * @param {function} options.onLimitReached         - Callback(req, res, options) when limit is hit
- * @param {string}   options.keyPrefix              - Prefix for store keys (default: 'rl:')
- */
-function createRateLimiter(options = {}) {
-  const {
-    windowMs = 60 * 1000,
-    max = 100,
-    keyGenerator = (req) => req.ip,
-    strategy = 'fixedWindow',
-    store = new MemoryStore(),
-    message = 'Too many requests, please try again later.',
-    statusCode = 429,
-    headers = true,
-    skipSuccessfulRequests = false,
-    skipFailedRequests = false,
-    skip = null,
-    onLimitReached = null,
-    keyPrefix = 'rl:',
-  } = options;
+function defaultKeyGenerator(req) {
+  return req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+}
 
-  const strategyFn = STRATEGIES[strategy];
-  if (!strategyFn) {
-    throw new Error(
-      `Unknown strategy "${strategy}". Valid strategies: ${Object.keys(STRATEGIES).join(', ')}`
-    );
+function defaultHandler(req, res, options, result) {
+  const retryAfter = computeRetryAfterSeconds(result);
+  res.status(options.statusCode).json({
+    error: options.message,
+    retryAfter,
+    limit: options.max,
+    remaining: Math.max(0, result.remaining),
+  });
+}
+
+function resolveLogger(logger) {
+  if (!logger) return createLogger({ silent: true });
+  if (isLoggerLike(logger)) return logger;
+  if (typeof logger === 'object') return createLogger(logger);
+  return createLogger({ silent: true });
+}
+
+function normalizeOptions(options = {}) {
+  const store = options.store || new MemoryStore();
+  const normalized = {
+    windowMs: options.windowMs ?? DEFAULT_WINDOW_MS,
+    max: options.max ?? DEFAULT_MAX,
+    keyGenerator: options.keyGenerator ?? defaultKeyGenerator,
+    strategy: options.strategy ?? DEFAULT_STRATEGY,
+    store,
+    message: options.message ?? DEFAULT_MESSAGE,
+    statusCode: options.statusCode ?? DEFAULT_STATUS_CODE,
+    standardHeaders: options.standardHeaders ?? (options.headers === false ? false : true),
+    skipSuccessfulRequests: options.skipSuccessfulRequests ?? false,
+    skipFailedRequests: options.skipFailedRequests ?? false,
+    skip: options.skip ?? null,
+    onLimitReached: options.onLimitReached ?? null,
+    handler: options.handler ?? null,
+    keyPrefix: options.keyPrefix ?? DEFAULT_KEY_PREFIX,
+    requestPropertyName: options.requestPropertyName ?? DEFAULT_REQUEST_PROPERTY,
+    failMode: options.failMode ?? DEFAULT_FAIL_MODE,
+  };
+
+  if (options.headers === false && options.standardHeaders === undefined) {
+    normalized.standardHeaders = false;
   }
 
-  const strategyOptions = { max, windowMs };
+  return normalized;
+}
+
+function createRateLimiter(options = {}) {
+  const normalized = normalizeOptions(options);
+  validateOptions(normalized);
+
+  const strategyFn = STRATEGIES[normalized.strategy];
+  const strategyOptions = { max: normalized.max, windowMs: normalized.windowMs };
+  const logger = resolveLogger(options.logger);
 
   return async function rateLimiterMiddleware(req, res, next) {
+    let key;
     try {
-      // 1. Check skip function
-      if (typeof skip === 'function') {
-        const shouldSkip = await skip(req, res);
+      if (typeof normalized.skip === 'function') {
+        const shouldSkip = await normalized.skip(req, res);
         if (shouldSkip) return next();
       }
 
-      // 2. Generate key
-      const rawKey = keyGenerator(req);
-      const key = `${keyPrefix}${rawKey}`;
+      const rawKey = normalized.keyGenerator(req);
+      if (rawKey === undefined || rawKey === null || rawKey === '') {
+        logger.warn('keyGenerator returned empty value; falling back to "unknown"');
+      }
+      key = `${normalized.keyPrefix}${rawKey || 'unknown'}`;
 
-      // 3. Apply strategy
-      const result = await strategyFn(store, key, strategyOptions);
-
-      // 4. Set headers if enabled
-      if (headers) {
-        res.setHeader('X-RateLimit-Limit', max);
-        res.setHeader('X-RateLimit-Remaining', result.remaining);
-        res.setHeader('X-RateLimit-Reset', Math.ceil(result.reset / 1000));
+      let result;
+      try {
+        result = await strategyFn(normalized.store, key, strategyOptions);
+      } catch (storeErr) {
+        const wrapped = storeErr instanceof StoreError
+          ? storeErr
+          : new StoreError(`Strategy execution failed: ${storeErr.message}`, storeErr);
+        logger.error('Rate limiter store error', { error: wrapped.message, code: wrapped.code });
+        if (normalized.failMode === 'closed') {
+          return res.status(503).json({ error: 'Rate limiter unavailable' });
+        }
+        return next();
       }
 
-      // 5. Handle limit reached
+      req[normalized.requestPropertyName] = {
+        limit: normalized.max,
+        current: result.count,
+        remaining: Math.max(0, result.remaining),
+        resetTime: new Date(result.reset),
+        strategy: normalized.strategy,
+      };
+
+      setRateLimitHeaders(res, result, normalized);
+
       if (!result.allowed) {
-        if (headers) {
-          const retryAfter = Math.ceil((result.reset - Date.now()) / 1000);
-          res.setHeader('Retry-After', Math.max(0, retryAfter));
-        }
+        setRetryAfter(res, result);
 
-        if (typeof onLimitReached === 'function') {
-          onLimitReached(req, res, options);
-        }
-
-        return res.status(statusCode).json({
-          error: message,
-          retryAfter: Math.ceil((result.reset - Date.now()) / 1000),
-        });
-      }
-
-      // 6. Handle skipSuccessfulRequests / skipFailedRequests
-      // We hook into res.on('finish') to potentially decrement if needed.
-      // Since our strategies already incremented, we undo on finish if skip conditions met.
-      if (skipSuccessfulRequests || skipFailedRequests) {
-        res.on('finish', async () => {
+        if (typeof normalized.onLimitReached === 'function') {
           try {
-            const isSuccess = res.statusCode < 400;
-            const isFailed = res.statusCode >= 400;
-
-            if ((skipSuccessfulRequests && isSuccess) || (skipFailedRequests && isFailed)) {
-              // Decrement: for fixedWindow we reset isn't ideal, but best-effort decrement
-              // We use a dedicated decrement approach by reading, subtracting, and setting
-              await _decrementKey(store, key, strategyOptions, strategy);
-            }
-          } catch (_err) {
-            // Non-critical: swallow errors in finish hook
+            normalized.onLimitReached(req, res, normalized, result);
+          } catch (cbErr) {
+            logger.error('onLimitReached callback threw', { error: cbErr.message });
           }
-        });
+        }
+
+        const handlerFn = typeof normalized.handler === 'function'
+          ? normalized.handler
+          : defaultHandler;
+        return handlerFn(req, res, normalized, result);
       }
 
-      // 7. Allow request
+      if (normalized.skipSuccessfulRequests || normalized.skipFailedRequests) {
+        _attachFinishHook(res, normalized, key, strategyFn, logger);
+      }
+
       next();
     } catch (err) {
+      logger.error('Rate limiter middleware error', { error: err.message });
       next(err);
     }
   };
 }
 
-/**
- * Best-effort decrement for skipSuccessful/skipFailed requests.
- * Only applicable to fixedWindow and slidingWindow in memory mode.
- */
-async function _decrementKey(store, key, strategyOptions, strategy) {
-  if (strategy === 'tokenBucket') return; // Token bucket: refill is time-based, no decrement needed
+function _attachFinishHook(res, normalized, key, strategyFn, logger) {
+  res.on('finish', async () => {
+    try {
+      const isSuccess = res.statusCode < 400;
+      const isFailed = res.statusCode >= 400;
+      const shouldDecrement =
+        (normalized.skipSuccessfulRequests && isSuccess) ||
+        (normalized.skipFailedRequests && isFailed);
 
-  if (strategy === 'fixedWindow') {
-    const entry = store.store && store.store.get(key);
-    if (entry && entry.value > 0) {
-      entry.value = Math.max(0, entry.value - 1);
-    }
-    return;
-  }
+      if (!shouldDecrement) return;
 
-  if (strategy === 'slidingWindow') {
-    // Remove the most recent timestamp we added
-    const timestamps = await store.get(key);
-    if (Array.isArray(timestamps) && timestamps.length > 0) {
-      timestamps.pop();
-      const ttl = Math.ceil(strategyOptions.windowMs / 1000);
-      await store.set(key, timestamps, ttl);
+      const decrementFn = typeof strategyFn.decrement === 'function' ? strategyFn.decrement : null;
+      if (!decrementFn) return;
+      await decrementFn(normalized.store, key, {
+        windowMs: normalized.windowMs,
+        max: normalized.max,
+      });
+    } catch (err) {
+      logger.warn('Decrement on skip-after-response failed', { error: err.message });
     }
-  }
+  });
 }
 
-module.exports = { createRateLimiter };
+module.exports = { createRateLimiter, STRATEGIES };
