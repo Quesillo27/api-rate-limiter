@@ -27,4 +27,4 @@ jobs:
         run: npm install
 
       - name: Run tests
-        run: npm run test:ci --if-present || npm test
+        run: npm run test:ci
