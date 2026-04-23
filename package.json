@@ -4,6 +4,8 @@
   "description": "Express middleware for API rate limiting with Redis support. Three strategies (fixed/sliding/token-bucket), presets, IETF draft-7 headers, fail-open/closed, structured logger.",
   "main": "src/index.js",
   "scripts": {
+    "start": "node examples/basic.js",
+    "dev": "node examples/basic.js",
     "test": "jest --coverage --forceExit",
     "test:watch": "jest --watch",
     "test:ci": "jest --coverage --ci --forceExit",

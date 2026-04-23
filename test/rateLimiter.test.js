@@ -220,6 +220,23 @@ describe('createRateLimiter', () => {
       expect(allowed.status).toBe(200);
     });
 
+    it('supports async keyGenerator functions', async () => {
+      const store = new MemoryStore();
+      const app = buildApp({
+        max: 1,
+        windowMs: 60000,
+        store,
+        keyGenerator: async (req) => req.headers['x-user-id'],
+      });
+
+      await request(app).get('/').set('x-user-id', 'user-1');
+      const blocked = await request(app).get('/').set('x-user-id', 'user-1');
+      const allowed = await request(app).get('/').set('x-user-id', 'user-2');
+
+      expect(blocked.status).toBe(429);
+      expect(allowed.status).toBe(200);
+    });
+
     it('falls back to "unknown" when keyGenerator returns empty', async () => {
       const store = new MemoryStore();
       const app = buildApp({
@@ -233,6 +250,42 @@ describe('createRateLimiter', () => {
       const res2 = await request(app).get('/');
       expect(res1.status).toBe(200);
       expect(res2.status).toBe(429);
+    });
+
+    it('falls back to "unknown" when async keyGenerator returns empty', async () => {
+      const store = new MemoryStore();
+      const app = buildApp({
+        max: 1,
+        windowMs: 60000,
+        store,
+        keyGenerator: async () => '',
+      });
+
+      const res1 = await request(app).get('/');
+      const res2 = await request(app).get('/');
+      expect(res1.status).toBe(200);
+      expect(res2.status).toBe(429);
+    });
+
+    it('forwards async keyGenerator errors to Express', async () => {
+      const store = new MemoryStore();
+      const app = express();
+      app.use(createRateLimiter({
+        max: 1,
+        windowMs: 60000,
+        store,
+        keyGenerator: async () => {
+          throw new Error('key lookup failed');
+        },
+      }));
+      app.get('/', (_req, res) => res.json({ ok: true }));
+      app.use((err, _req, res, _next) => {
+        res.status(500).json({ error: err.message });
+      });
+
+      const res = await request(app).get('/');
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'key lookup failed' });
     });
   });
 

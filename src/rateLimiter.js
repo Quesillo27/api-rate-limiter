@@ -26,7 +26,10 @@ const STRATEGIES = {
 };
 
 function defaultKeyGenerator(req) {
-  return req.ip || (req.connection && req.connection.remoteAddress) || 'unknown';
+  return req.ip
+    || (req.socket && req.socket.remoteAddress)
+    || (req.connection && req.connection.remoteAddress)
+    || 'unknown';
 }
 
 function defaultHandler(req, res, options, result) {
@@ -90,7 +93,7 @@ function createRateLimiter(options = {}) {
         if (shouldSkip) return next();
       }
 
-      const rawKey = normalized.keyGenerator(req);
+      const rawKey = await normalized.keyGenerator(req);
       if (rawKey === undefined || rawKey === null || rawKey === '') {
         logger.warn('keyGenerator returned empty value; falling back to "unknown"');
       }

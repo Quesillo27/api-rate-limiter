@@ -3,8 +3,8 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen)
 ![npm version](https://img.shields.io/badge/npm-1.1.0-blue)
-![tests](https://img.shields.io/badge/tests-134%20passing-brightgreen)
-![coverage](https://img.shields.io/badge/coverage-84%25-brightgreen)
+![tests](https://img.shields.io/badge/tests-137%20passing-brightgreen)
+![coverage](https://img.shields.io/badge/coverage-86%25-brightgreen)
 
 Express middleware for API rate limiting with Redis support. Implements three battle-tested strategies — **fixed window**, **sliding window**, and **token bucket** — with modular stores, ready-to-use presets, IETF draft-7 standard headers, structured logging, and fail-open / fail-closed behavior. Works out of the box with an in-memory store and scales to Redis for distributed deployments.
 
@@ -22,9 +22,10 @@ Express middleware for API rate limiting with Redis support. Implements three ba
 - **Fail-open / fail-closed:** pick behavior when the store is unreachable
 - **Strict option validation:** typed `ConfigurationError` thrown at middleware creation
 - **Skip rules:** async `skip(req)` + `skipSuccessfulRequests` / `skipFailedRequests`
+- **Async key support:** `keyGenerator` can resolve keys from async lookups before limiting
 - **Namespacing:** `keyPrefix` isolates counters across features
 - **Zero-leak lifecycle:** `MemoryStore.destroy()` clears intervals, `RedisStore.resetAll()` scans & deletes
-- **134 tests** (Jest + Supertest) across 9 suites, 84% line coverage
+- **137 tests** (Jest + Supertest) across 9 suites, 86% line coverage
 
 ---
 
@@ -107,7 +108,7 @@ src/
 |--------------------------|--------------------------------|--------------------------------------------|---------------------------------------------------------------|
 | `windowMs`               | `number`                       | `60000`                                    | Time window in milliseconds                                   |
 | `max`                    | `number`                       | `100`                                      | Maximum requests allowed per window                           |
-| `keyGenerator`           | `(req) => string`              | `req.ip → remoteAddress → 'unknown'`       | Unique key per client                                         |
+| `keyGenerator`           | `(req) => string \| Promise<string>` | `req.ip → remoteAddress → 'unknown'` | Unique key per client, including async lookups                |
 | `strategy`               | `string`                       | `'fixedWindow'`                            | `fixedWindow` \| `slidingWindow` \| `tokenBucket`             |
 | `store`                  | `object`                       | `new MemoryStore()`                        | Any store with `get/set/increment/reset` methods              |
 | `message`                | `string`                       | `'Too many requests...'`                   | Response body message when limited                            |
@@ -221,6 +222,17 @@ createRateLimiter({
   windowMs: 60000,
   max: 1000,
   keyGenerator: (req) => req.user?.id || req.ip,
+  keyPrefix: 'rl:user:',
+});
+```
+
+### Async key lookup
+
+```js
+createRateLimiter({
+  windowMs: 60000,
+  max: 30,
+  keyGenerator: async (req) => req.user?.id || req.ip,
   keyPrefix: 'rl:user:',
 });
 ```
